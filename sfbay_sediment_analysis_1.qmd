@@ -1,0 +1,771 @@
+---
+title: "Sediment Microplastic Analysis"
+format: html
+editor: visual
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(sf)
+library(janitor)
+library(forcats)
+library(scales)
+library(purrr)
+```
+
+# Part 1: Sediment Chemistry vs Microplastics
+
+Spatial join between sediment microplastic sites and chemistry sites (PCBs, PAHs, pesticides, metals), with Spearman correlations and simple linear models.
+
+```{r sed-chem}
+sed_plastic <- read_csv("sediment_plastic_spatial_master_clean.csv",
+                        show_col_types = FALSE) |> clean_names()
+sed_chem    <- read_csv("sediment_chemistry_spatial_master_clean.csv",
+                        show_col_types = FALSE) |> clean_names()
+
+# Keep only rows with coordinates
+sed_plastic <- sed_plastic |> filter(!is.na(latitude), !is.na(longitude))
+sed_chem    <- sed_chem    |> filter(!is.na(latitude), !is.na(longitude))
+
+# Convert to sf and project to California Albers for distance calculations
+sed_plastic_sf <- st_as_sf(sed_plastic, coords = c("longitude", "latitude"),
+                            crs = 4326, remove = FALSE) |> st_transform(3310)
+sed_chem_sf    <- st_as_sf(sed_chem,    coords = c("longitude", "latitude"),
+                            crs = 4326, remove = FALSE) |> st_transform(3310)
+
+# Match each plastic site to its nearest chemistry site
+nearest_idx <- st_nearest_feature(sed_plastic_sf, sed_chem_sf)
+
+sed_compare <- sed_plastic_sf |>
+  mutate(chem_row_id = nearest_idx) |>
+  bind_cols(
+    sed_chem_sf[nearest_idx, ] |>
+      st_drop_geometry() |>
+      rename_with(~ paste0("chem_", .x))
+  ) |>
+  mutate(
+    match_distance_m  = as.numeric(st_distance(sed_plastic_sf, sed_chem_sf[nearest_idx, ],
+                                               by_element = TRUE)),
+    match_distance_km = match_distance_m / 1000
+  )
+
+# Distance distribution
+summary(sed_compare$match_distance_km)
+table(cut(sed_compare$match_distance_km,
+          breaks = c(0, 2, 5, 10, 20, 50, Inf), include.lowest = TRUE))
+
+# Filter to 5 km threshold and log-transform contaminant totals
+sed_model_data <- sed_compare |>
+  filter(match_distance_km <= 5) |>
+  st_drop_geometry() |>
+  mutate(
+    log_total_microplastics = log10(total_microplastics_concentration + 1),
+    log_total_pcb           = log10(chem_pcbs_total_ugkgdw_equiv + 1),
+    log_total_pah           = log10(chem_pahs_total_ugkgdw_equiv + 1),
+    log_total_pesticides    = log10(chem_pesticides_total_ugkgdw_equiv + 1),
+    log_total_metals        = log10(chem_metals_total_ugkgdw_equiv + 1)
+  )
+
+cat("Sites retained after 5 km filter:", nrow(sed_model_data), "\n")
+
+# Check missingness
+sed_model_data |>
+  summarise(
+    n                = n(),
+    missing_micro    = sum(is.na(log_total_microplastics)),
+    missing_pcb      = sum(is.na(log_total_pcb)),
+    missing_pah      = sum(is.na(log_total_pah)),
+    missing_pesticides = sum(is.na(log_total_pesticides)),
+    missing_metals   = sum(is.na(log_total_metals))
+  )
+```
+
+```{r sed-chem-plots}
+# Exploratory scatterplots (log-log)
+vars <- list(
+  list(x = "log_total_pcb",        label = "Log total PCB"),
+  list(x = "log_total_pah",        label = "Log total PAH"),
+  list(x = "log_total_pesticides", label = "Log total pesticides"),
+  list(x = "log_total_metals",     label = "Log total metals")
+)
+
+for (v in vars) {
+  p <- ggplot(sed_model_data, aes(.data[[v$x]], log_total_microplastics)) +
+    geom_point(aes(size = match_distance_km)) +
+    geom_smooth(method = "lm", se = FALSE) +
+    labs(
+      title = paste("Sediment: microplastics vs", sub("Log total ", "", v$label)),
+      x = v$label,
+      y = "Log total microplastics",
+      size = "Match distance (km)"
+    ) +
+    theme_minimal()
+  print(p)
+}
+```
+
+```{r sed-chem-models}
+# Spearman correlations
+for (v in vars) {
+  cat("\n---", v$label, "---\n")
+  print(cor.test(sed_model_data$log_total_microplastics,
+                 sed_model_data[[v$x]],
+                 method = "spearman", exact = FALSE))
+}
+
+# Simple linear models
+m_pcb  <- lm(log_total_microplastics ~ log_total_pcb,        data = sed_model_data)
+m_pah  <- lm(log_total_microplastics ~ log_total_pah,        data = sed_model_data)
+m_pest <- lm(log_total_microplastics ~ log_total_pesticides, data = sed_model_data)
+m_met  <- lm(log_total_microplastics ~ log_total_metals,     data = sed_model_data)
+
+summary(m_pcb)
+summary(m_pah)
+summary(m_pest)
+summary(m_met)
+
+# Cook's distance check on the PCB model (strongest predictor)
+# Filter to rows the model actually used (drops any NA in log_total_pcb)
+model_frame <- sed_model_data |>
+  filter(!is.na(log_total_pcb)) |>
+  mutate(
+    cooks_pcb  = cooks.distance(m_pcb),
+    resid_pcb  = residuals(m_pcb),
+    fitted_pcb = fitted(m_pcb)
+  )
+
+model_frame |>
+  select(station_code, station_name, match_distance_km,
+         log_total_microplastics, log_total_pcb, cooks_pcb) |>
+  arrange(desc(cooks_pcb))
+
+ggplot(model_frame, aes(fitted_pcb, resid_pcb)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Residual plot: microplastics ~ PCB",
+       x = "Fitted values", y = "Residuals") +
+  theme_minimal()
+
+# Sensitivity: remove highest-influence point and refit
+top_outlier <- model_frame |> slice_max(cooks_pcb, n = 1)
+m_pcb_no_outlier <- lm(log_total_microplastics ~ log_total_pcb,
+                        data = anti_join(model_frame, top_outlier, by = "station_code"))
+summary(m_pcb_no_outlier)
+
+# Two-predictor model (PCB + metals)
+m_two <- lm(log_total_microplastics ~ log_total_pcb + log_total_metals,
+            data = sed_model_data)
+summary(m_two)
+
+write_csv(sed_model_data, "sediment_spatial_compare_5km_clean.csv")
+```
+
+------------------------------------------------------------------------
+
+# Part 2: Sediment Microplastics vs Individual Metals
+
+Matches each sediment microplastic site to its nearest metals site within 5 km, then runs Spearman correlations per metal with p-values.
+
+```{r metals-setup}
+plastic <- read_csv("sediment_plastic_spatial_master_clean.csv",
+                    show_col_types = FALSE) |> clean_names()
+metals  <- read_csv("full_sediment_specific_metals_wide.csv",
+                    show_col_types = FALSE) |> clean_names()
+
+plastic <- plastic |> filter(!is.na(latitude), !is.na(longitude))
+metals  <- metals  |> filter(!is.na(latitude), !is.na(longitude))
+
+plastic_sf <- st_as_sf(plastic, coords = c("longitude", "latitude"),
+                       crs = 4326, remove = FALSE) |> st_transform(3310)
+metals_sf  <- st_as_sf(metals,  coords = c("longitude", "latitude"),
+                       crs = 4326, remove = FALSE) |> st_transform(3310)
+
+nearest_idx <- st_nearest_feature(plastic_sf, metals_sf)
+
+distance_threshold_km <- 5
+
+compare_sf <- plastic_sf |>
+  mutate(nearest_metal_row = nearest_idx) |>
+  bind_cols(
+    metals_sf[nearest_idx, ] |>
+      st_drop_geometry() |>
+      rename_with(~ paste0("metal_", .x))
+  ) |>
+  mutate(
+    match_distance_m  = as.numeric(st_distance(plastic_sf, metals_sf[nearest_idx, ],
+                                               by_element = TRUE)),
+    match_distance_km = match_distance_m / 1000
+  )
+
+compare_df <- compare_sf |>
+  filter(match_distance_km <= distance_threshold_km) |>
+  st_drop_geometry()
+
+# Pull individual metal columns (exclude the pre-summed total)
+metal_cols <- names(compare_df) |>
+  str_subset("^metal_.*mgkgdw_equiv$") |>
+  setdiff("metal_total_metals_mgkgdw_equiv")
+
+# Long format
+plot_df <- compare_df |>
+  select(station_code, station_name, latitude, longitude,
+         total_microplastics_concentration, match_distance_km,
+         all_of(metal_cols)) |>
+  pivot_longer(cols = all_of(metal_cols),
+               names_to = "metal", values_to = "metal_concentration") |>
+  mutate(
+    metal = metal |>
+      str_remove("^metal_") |>
+      str_remove("_mgkgdw_equiv$") |>
+      str_replace_all("_", " ") |>
+      str_to_title(),
+    log_microplastics = log10(total_microplastics_concentration + 1),
+    log_metal         = log10(metal_concentration + 1)
+  ) |>
+  filter(!is.na(metal_concentration))
+```
+
+```{r metals-pvals}
+# Run cor.test per metal column and collect results
+metal_pvals <- map_dfr(metal_cols, function(col) {
+  df <- compare_df |>
+    select(total_microplastics_concentration, value = all_of(col)) |>
+    filter(!is.na(value), !is.na(total_microplastics_concentration)) |>
+    mutate(
+      log_plastic = log10(total_microplastics_concentration + 1),
+      log_metal   = log10(value + 1)
+    )
+
+  if (nrow(df) < 6) return(NULL)
+
+  test <- cor.test(df$log_plastic, df$log_metal,
+                   method = "spearman", exact = FALSE)
+
+  tibble(
+    metal       = col |>
+      str_remove("^metal_") |>
+      str_remove("_ugkgdw.*$") |>
+      str_replace_all("_", " ") |>
+      str_to_title(),
+    n           = nrow(df),
+    spearman_rho = test$estimate,
+    p_value      = test$p.value
+  )
+})
+
+print(metal_pvals)
+```
+
+```{r metals-ranked-plot}
+# Ranked lollipop plot with significance labels
+rank_df <- metal_pvals |>
+  filter(n >= 6) |>
+  mutate(
+    metal     = fct_reorder(metal, spearman_rho),
+    sig_label = case_when(
+      p_value < 0.01 ~ paste0("p=", round(p_value, 3), "**"),
+      p_value < 0.05 ~ paste0("p=", round(p_value, 3), "*"),
+      TRUE            ~ paste0("p=", round(p_value, 3))
+    )
+  )
+
+p_metals_rank <- ggplot(rank_df, aes(x = spearman_rho, y = metal)) +
+  geom_vline(xintercept = 0, linewidth = 0.7, color = "gray65") +
+  geom_segment(aes(x = 0, xend = spearman_rho, y = metal, yend = metal),
+               linewidth = 1, color = "gray70") +
+  geom_point(aes(size = n, fill = spearman_rho),
+             shape = 21, color = "black", stroke = 0.5) +
+  geom_text(
+    aes(x = spearman_rho + ifelse(spearman_rho >= 0, 0.06, -0.06),
+        label = sig_label),
+    size = 3,
+    hjust = ifelse(rank_df$spearman_rho >= 0, 0, 1),
+    color = ifelse(rank_df$p_value < 0.05, "black", "gray60")
+  ) +
+  scale_fill_gradient2(low = "#B22222", mid = "white", high = "#1F78B4",
+                       midpoint = 0, name = "Spearman rho") +
+  scale_size_continuous(name = "n", range = c(3, 9),
+                        breaks = c(6, 8, 10, 12, 14)) +
+  scale_x_continuous(limits = c(-1.0, 0.85)) +
+  labs(
+    title    = "Sediment Microplastics vs Individual Metals",
+    subtitle = paste0("Spearman correlations, nearest-site matches within ",
+                      distance_threshold_km, " km"),
+    x        = "Spearman rho",
+    y        = NULL,
+    caption  = "** p < 0.01   * p < 0.05   Gray labels = non-significant"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 22),
+    plot.subtitle    = element_text(size = 15),
+    axis.title.x     = element_text(size = 16),
+    axis.text.x      = element_text(size = 13),
+    axis.text.y      = element_text(face = "bold", size = 13),
+    panel.grid.minor  = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_line(color = "gray88"),
+    legend.position  = "bottom"
+  )
+
+print(p_metals_rank)
+
+ggsave("sediment_microplastics_vs_individual_metals_ranked.png",
+       p_metals_rank, width = 10, height = 7, dpi = 300, bg = "white")
+```
+
+```{r metals-facet}
+# Summary stats
+metal_summary <- plot_df |>
+  group_by(metal) |>
+  summarise(
+    n                    = n(),
+    spearman_rho         = suppressWarnings(
+      cor(log_microplastics, log_metal, method = "spearman", use = "complete.obs")
+    ),
+    min_distance_km      = min(match_distance_km, na.rm = TRUE),
+    median_distance_km   = median(match_distance_km, na.rm = TRUE),
+    max_distance_km      = max(match_distance_km, na.rm = TRUE),
+    mean_log_metal       = mean(log_metal, na.rm = TRUE),
+    mean_log_microplastics = mean(log_microplastics, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(abs(spearman_rho)), desc(n))
+
+print(metal_summary)
+write_csv(metal_summary, "sediment_individual_metals_summary.csv")
+write_csv(compare_df,    "sediment_plastics_nearest_metals_filtered.csv")
+
+# Select top 3 positive and top 2 negative correlations for the figure
+top_positive  <- metal_summary |> filter(n >= 6, spearman_rho > 0) |>
+  arrange(desc(spearman_rho)) |> slice_head(n = 3) |> pull(metal)
+top_negative  <- metal_summary |> filter(n >= 6, spearman_rho < 0) |>
+  arrange(spearman_rho) |> slice_head(n = 2) |> pull(metal)
+selected_metals <- unique(c(top_positive, top_negative))
+
+# Fallback if fewer than 4 metals qualify
+if (length(selected_metals) < 4) {
+  selected_metals <- metal_summary |> filter(n >= 6) |>
+    slice_head(n = 5) |> pull(metal)
+}
+
+label_df <- metal_summary |>
+  filter(metal %in% selected_metals) |>
+  mutate(
+    facet_label = paste0(metal, "\n",
+                         "n = ", n, "   ",
+                         "rho = ", round(spearman_rho, 2))
+  ) |>
+  select(metal, facet_label, spearman_rho)
+
+plot_df_top <- plot_df |>
+  filter(metal %in% selected_metals) |>
+  left_join(label_df, by = "metal") |>
+  mutate(
+    facet_label = factor(facet_label,
+                         levels = label_df |>
+                           arrange(desc(abs(spearman_rho))) |>
+                           pull(facet_label))
+  )
+
+p_selected <- ggplot(plot_df_top, aes(x = log_metal, y = log_microplastics)) +
+  geom_point(aes(size = match_distance_km), color = "black", alpha = 0.8) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1, color = "#1F78B4") +
+  facet_wrap(~ facet_label, scales = "free_x", ncol = 2) +
+  scale_size_continuous(name = "Match distance (km)", range = c(2.5, 6)) +
+  labs(
+    title    = "Sediment Microplastics vs Selected Metals",
+    subtitle = paste0("Nearest sediment metals site within ", distance_threshold_km, " km"),
+    x        = "Log10 metal concentration + 1",
+    y        = "Log10 total microplastics concentration + 1",
+    caption  = "Panels show metals with the strongest correlations and usable coverage"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 19),
+    plot.subtitle = element_text(size = 12),
+    strip.text    = element_text(face = "bold", size = 12),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray88"),
+    legend.position  = "bottom"
+  )
+
+print(p_selected)
+ggsave("sediment_microplastics_vs_selected_metals.png",
+       p_selected, width = 11, height = 8, dpi = 300, bg = "white")
+
+# Screening view: all metals with at least 5 observations
+screen_df <- metal_summary |>
+  filter(n >= 5) |>
+  mutate(facet_label = paste0(metal, "\n", "n = ", n,
+                              "   rho = ", round(spearman_rho, 2))) |>
+  arrange(desc(abs(spearman_rho)))
+
+plot_df_screen <- plot_df |>
+  inner_join(screen_df |> select(metal, facet_label), by = "metal") |>
+  mutate(facet_label = factor(facet_label, levels = screen_df$facet_label))
+
+p_screen <- ggplot(plot_df_screen, aes(x = log_metal, y = log_microplastics)) +
+  geom_point(color = "black", alpha = 0.75, size = 2.2) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.9, color = "#1F78B4") +
+  facet_wrap(~ facet_label, scales = "free_x", ncol = 3) +
+  labs(
+    title    = "Sediment Microplastics vs Individual Metals",
+    subtitle = paste0("All metals with at least 5 observations within ",
+                      distance_threshold_km, " km"),
+    x        = "Log10 metal concentration + 1",
+    y        = "Log10 total microplastics concentration + 1"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 17),
+    plot.subtitle = element_text(size = 11),
+    strip.text    = element_text(face = "bold", size = 10),
+    panel.grid.minor = element_blank(),
+    legend.position  = "none"
+  )
+
+print(p_screen)
+ggsave("sediment_microplastics_vs_all_metals_screening.png",
+       p_screen, width = 13, height = 9, dpi = 300, bg = "white")
+```
+
+------------------------------------------------------------------------
+
+# Part 3: Sediment Microplastics vs Contaminant Families
+
+Same spatial matching framework, but using family-level totals (PCBs, PAHs, pesticides, metals) rather than individual metals, with p-values.
+
+```{r families}
+chem <- read_csv("full_sediment_chemistry_network_clean.csv",
+                 show_col_types = FALSE) |> clean_names()
+
+chem <- chem |> filter(!is.na(latitude), !is.na(longitude))
+
+chem_sf <- st_as_sf(chem, coords = c("longitude", "latitude"),
+                    crs = 4326, remove = FALSE) |> st_transform(3310)
+
+# Re-read plastic data so this part runs independently of Part 2
+plastic_chem <- read_csv("sediment_plastic_spatial_master_clean.csv",
+                         show_col_types = FALSE) |>
+  clean_names() |>
+  filter(!is.na(latitude), !is.na(longitude))
+
+plastic_sf_chem <- st_as_sf(plastic_chem, coords = c("longitude", "latitude"),
+                             crs = 4326, remove = FALSE) |> st_transform(3310)
+
+nearest_idx_chem <- st_nearest_feature(plastic_sf_chem, chem_sf)
+
+compare_sf_chem <- plastic_sf_chem |>
+  mutate(nearest_chem_row = nearest_idx_chem) |>
+  bind_cols(
+    chem_sf[nearest_idx_chem, ] |>
+      st_drop_geometry() |>
+      rename_with(~ paste0("chem_", .x))
+  ) |>
+  mutate(
+    match_distance_m  = as.numeric(st_distance(plastic_sf_chem, chem_sf[nearest_idx_chem, ],
+                                               by_element = TRUE)),
+    match_distance_km = match_distance_m / 1000
+  )
+
+compare_df_chem <- compare_sf_chem |>
+  filter(match_distance_km <= distance_threshold_km) |>
+  st_drop_geometry()
+
+family_df <- compare_df_chem |>
+  select(
+    station_code, station_name, total_microplastics_concentration, match_distance_km,
+    chem_pcbs_total_ugkgdw_equiv, chem_pahs_total_ugkgdw_equiv,
+    chem_pesticides_total_ugkgdw_equiv, chem_metals_total_ugkgdw_equiv
+  ) |>
+  pivot_longer(cols = starts_with("chem_"),
+               names_to = "contaminant_family", values_to = "contaminant_value") |>
+  mutate(
+    contaminant_family = recode(
+      contaminant_family,
+      chem_pcbs_total_ugkgdw_equiv         = "PCBs",
+      chem_pahs_total_ugkgdw_equiv         = "PAHs",
+      chem_pesticides_total_ugkgdw_equiv   = "Pesticides",
+      chem_metals_total_ugkgdw_equiv       = "Metals Total"
+    ),
+    log_microplastics = log10(total_microplastics_concentration + 1),
+    log_contaminant   = log10(contaminant_value + 1)
+  ) |>
+  filter(!is.na(contaminant_value))
+
+# Summary with p-values
+family_summary <- family_df |>
+  group_by(contaminant_family) |>
+  summarise(
+    n = n(),
+    spearman_rho = suppressWarnings(
+      cor(log_microplastics, log_contaminant, method = "spearman", use = "complete.obs")
+    ),
+    p_value = cor.test(log_microplastics, log_contaminant,
+                       method = "spearman", exact = FALSE)$p.value,
+    median_distance_km = median(match_distance_km, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(abs(spearman_rho)))
+
+print(family_summary)
+write_csv(family_summary, "sediment_contaminant_families_summary.csv")
+write_csv(compare_df_chem, "sediment_plastics_nearest_contaminants_5km.csv")
+```
+
+```{r families-plot}
+label_df_fam <- family_summary |>
+  mutate(
+    facet_label = paste0(contaminant_family, "\n",
+                         "n = ", n,
+                         "   rho = ", round(spearman_rho, 2),
+                         "   p = ", round(p_value, 3),
+                         "   median d = ", round(median_distance_km, 1), " km")
+  ) |>
+  select(contaminant_family, facet_label, spearman_rho)
+
+plot_df_fam <- family_df |>
+  left_join(label_df_fam, by = "contaminant_family") |>
+  mutate(
+    facet_label = factor(facet_label,
+                         levels = label_df_fam |>
+                           arrange(desc(abs(spearman_rho))) |>
+                           pull(facet_label))
+  )
+
+p_family <- ggplot(plot_df_fam, aes(x = log_contaminant, y = log_microplastics)) +
+  geom_point(aes(color = match_distance_km), shape = 1, size = 2.2, stroke = 1.3) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.05, color = "#c83b3b") +
+  facet_wrap(~ facet_label, scales = "free", ncol = 2) +
+  scale_color_gradient(low = "#7a0000", high = "#f2b6b6",
+                       name = "Match distance (km)") +
+  labs(
+    title    = "Sediment Microplastics vs Contaminant Families",
+    subtitle = paste0("Nearest-site matches within ", distance_threshold_km,
+                      " km; darker outlines indicate closer matches"),
+    x        = "Log10 contaminant concentration + 1",
+    y        = "Log10 total microplastics concentration + 1"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 19),
+    plot.subtitle = element_text(size = 12),
+    strip.text    = element_text(face = "bold", size = 11),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "gray88"),
+    legend.position  = "bottom"
+  )
+
+print(p_family)
+ggsave("sediment_microplastics_vs_contaminant_families.png",
+       p_family, width = 11, height = 8, dpi = 300, bg = "white")
+```
+
+------------------------------------------------------------------------
+
+# Part 4: Sediment NDTI --- Temporal Matching and Sensitivity Analysis
+
+This section covers the core NDTI-to-microplastic analysis. It tests four temporal matching strategies (nearest image, 3-day, 7-day, and 30-day windows) and compares how sensitive the plastic-NDTI relationship is to that choice.
+
+```{r ndti-load}
+ndti_long <- read_csv("NDTIpoints_baywide_long_with_satellite_coords.csv",
+                      show_col_types = FALSE) |>
+  mutate(
+    SamplingDate = as.Date(SamplingDate),
+    image_date   = as.Date(image_date),
+    NDTI         = as.numeric(NDTI),
+    total_concentration_particles_per_g =
+      as.numeric(total_concentration_particles_per_g)
+  ) |>
+  filter(
+    !is.na(SamplingDate),
+    !is.na(image_date),
+    !is.na(NDTI),
+    !is.na(total_concentration_particles_per_g)
+  ) |>
+  mutate(
+    days_from_sample     = as.numeric(image_date - SamplingDate),
+    abs_days_from_sample = abs(days_from_sample),
+    log_plastic          = log10(total_concentration_particles_per_g)
+  )
+```
+
+```{r ndti-methods}
+# Helper to collapse a filtered long df to one row per site-date
+summarise_site_dates <- function(df, method_label) {
+  df |>
+    group_by(SiteDateID) |>
+    summarise(
+      StationCode   = first(StationCode),
+      StationName   = first(StationName),
+      SamplingDate  = first(SamplingDate),
+      Latitude      = first(Latitude),
+      Longitude     = first(Longitude),
+      total_concentration_particles_per_g =
+        first(total_concentration_particles_per_g),
+      log_plastic          = first(log_plastic),
+      ndti_value           = mean(NDTI, na.rm = TRUE),
+      min_days_from_sample = min(abs_days_from_sample, na.rm = TRUE),
+      n_images_used        = n(),
+      method               = method_label,
+      .groups = "drop"
+    )
+}
+
+# Build nearest-image dataset first (special case: filter to min days, not a fixed window)
+nearest_df <- ndti_long |>
+  group_by(SiteDateID) |>
+  filter(abs_days_from_sample == min(abs_days_from_sample, na.rm = TRUE)) |>
+  ungroup() |>
+  summarise_site_dates("nearest") |>
+  mutate(match_quality = case_when(
+    min_days_from_sample <= 3  ~ "very_close",
+    min_days_from_sample <= 7  ~ "close",
+    min_days_from_sample <= 30 ~ "usable",
+    TRUE                       ~ "poor"
+  ))
+
+# Build fixed-window datasets via map() to avoid repetition
+windows <- list(window_3d = 3, window_7d = 7, window_30d = 30)
+
+window_dfs <- imap(windows, function(days, label) {
+  ndti_long |>
+    filter(abs_days_from_sample <= days) |>
+    summarise_site_dates(label)
+})
+
+list2env(window_dfs, envir = .GlobalEnv)
+
+sensitivity_df <- bind_rows(nearest_df, window_3_df, window_7_df, window_30_df)
+
+cat("Site counts by method:\n")
+print(sensitivity_df |> count(method))
+```
+
+```{r ndti-models}
+# Run lm + Spearman for each method
+run_model_summary <- function(df, method_name) {
+  if (nrow(df) < 3) {
+    return(tibble(method = method_name, n = nrow(df),
+                  slope = NA_real_, r_squared = NA_real_, p_value = NA_real_,
+                  spearman_rho = NA_real_, spearman_p = NA_real_))
+  }
+
+  mod  <- lm(log_plastic ~ ndti_value, data = df)
+  msum <- summary(mod)
+  spr  <- suppressWarnings(cor.test(df$ndti_value, df$log_plastic,
+                                    method = "spearman"))
+
+  tibble(
+    method       = method_name,
+    n            = nrow(df),
+    slope        = unname(coef(mod)["ndti_value"]),
+    r_squared    = msum$r.squared,
+    p_value      = coef(msum)[2, 4],
+    spearman_rho = unname(spr$estimate),
+    spearman_p   = spr$p.value
+  )
+}
+
+model_results <- bind_rows(
+  run_model_summary(nearest_df,   "nearest"),
+  run_model_summary(window_3_df,  "window_3d"),
+  run_model_summary(window_7_df,  "window_7d"),
+  run_model_summary(window_30_df, "window_30d")
+)
+
+cat("Model comparison across temporal matching methods:\n")
+print(model_results)
+```
+
+```{r ndti-plots}
+# Scatterplot: plastic vs NDTI colored by match quality (nearest only)
+p_nearest_scatter <- ggplot(nearest_df,
+                             aes(x = ndti_value,
+                                 y = total_concentration_particles_per_g)) +
+  geom_point(aes(color = match_quality), size = 3) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  scale_y_log10() +
+  labs(
+    x     = "NDTI (turbidity proxy)",
+    y     = "Microplastic concentration (log scale)",
+    color = "Match quality",
+    title = "Surface water concentration vs nearest NDTI"
+  ) +
+  theme_minimal()
+
+print(p_nearest_scatter)
+
+# Time mismatch diagnostic
+p_time_mismatch <- ggplot(nearest_df,
+                           aes(x = min_days_from_sample, y = ndti_value)) +
+  geom_point(size = 3) +
+  labs(x = "Days from sampling date", y = "Nearest NDTI",
+       title = "Temporal mismatch diagnostic") +
+  theme_minimal()
+
+print(p_time_mismatch)
+
+# Spatial map of microplastic concentration vs NDTI
+spatial_data <- st_as_sf(nearest_df,
+                          coords = c("Longitude", "Latitude"), crs = 4326)
+
+p_map <- ggplot(spatial_data) +
+  geom_sf(aes(size = total_concentration_particles_per_g, color = ndti_value)) +
+  scale_size_continuous(trans = "log10") +
+  labs(size  = "Microplastic concentration",
+       color = "Nearest NDTI",
+       title = "Spatial comparison: microplastic concentration and NDTI") +
+  theme_minimal()
+
+print(p_map)
+
+# Sensitivity: faceted scatter across all four methods
+p_sensitivity <- ggplot(sensitivity_df,
+                         aes(x = ndti_value,
+                             y = total_concentration_particles_per_g)) +
+  geom_point(size = 3, color = "red") +
+  geom_smooth(method = "lm", se = TRUE, color = "black") +
+  scale_y_log10() +
+  facet_wrap(~ method, scales = "free_x") +
+  labs(
+    x     = "NDTI",
+    y     = "Microplastic concentration (log scale)",
+    title = "Sensitivity of plastic-NDTI relationship to temporal matching method"
+  ) +
+  theme_minimal()
+
+print(p_sensitivity)
+
+# Image count per site-date by method
+p_coverage <- ggplot(sensitivity_df, aes(x = method, y = n_images_used)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.15, alpha = 0.7) +
+  labs(x = "Matching method", y = "Number of satellite images used",
+       title = "Number of images contributing to each site estimate") +
+  theme_minimal()
+
+print(p_coverage)
+
+# Effect size comparison across methods
+model_results |>
+  select(method, spearman_rho, r_squared) |>
+  pivot_longer(cols = c(spearman_rho, r_squared),
+               names_to = "metric", values_to = "value") |>
+  ggplot(aes(x = method, y = value, fill = metric)) +
+  geom_col(position = "dodge") +
+  labs(x = "Matching method", y = "Statistic value",
+       title = "Effect size comparison across temporal matching methods") +
+  theme_minimal()
+
+# Export
+write_csv(nearest_df,      "ndti_nearest_site_all.csv")
+write_csv(sensitivity_df,  "ndti_sensitivity_site_level.csv")
+write_csv(model_results,   "ndti_sensitivity_model_results.csv")
+```
+
+```{r session-info}
+sessionInfo()
+```
